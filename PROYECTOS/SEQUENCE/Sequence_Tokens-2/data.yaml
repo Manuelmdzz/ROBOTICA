@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 5
+names: ['Blue_Token', 'Board', 'Green_Token', 'Red_Token', 'Tokens']
+
+roboflow:
+  workspace: yoloconteocartas
+  project: sequence_tokens-3wuzh
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/yoloconteocartas/sequence_tokens-3wuzh/dataset/2
