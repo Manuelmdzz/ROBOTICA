@@ -65,6 +65,48 @@ def main():
             device=device,
             verbose=False
         )
+        
+        # 1. Buscar la detección del tablero
+        board_bbox = None
+        for r in results:
+            for box in r.boxes:
+                # Asume que la clase 0 es tu tablero. ¡Verifícalo!
+                if int(box.cls) == 0: 
+                    # Obtiene las coordenadas [x1, y1, x2, y2]
+                    board_bbox = box.xyxy[0].cpu().numpy().astype(int)
+                    break
+            if board_bbox is not None:
+                break
+
+        # 2. Si se detectó el tablero, procesarlo
+        if board_bbox is not None:
+            # Dibuja la caja del tablero detectada por YOLO
+            cv2.rectangle(annotated, (board_bbox[0], board_bbox[1]), (board_bbox[2], board_bbox[3]), (0, 255, 0), 2)
+
+            # 3. Recorta la región del tablero
+            board_img = frame[board_bbox[1]:board_bbox[3], board_bbox[0]:board_bbox[2]]
+            
+            # 4. (OPCIONAL PERO RECOMENDADO) Corregir perspectiva para una vista cenital
+            # Para simplificar, asumimos una vista casi cenital. Si no, necesitarías
+            # encontrar las 4 esquinas y usar cv2.getPerspectiveTransform y cv2.warpPerspective.
+            
+            h, w, _ = board_img.shape
+            
+            # 5. Dibuja la cuadrícula 10x10 sobre la imagen anotada
+            rows, cols = 10, 10
+            cell_width = (board_bbox[2] - board_bbox[0]) // cols
+            cell_height = (board_bbox[3] - board_bbox[1]) // rows
+
+            for i in range(1, cols):
+                x = board_bbox[0] + i * cell_width
+                cv2.line(annotated, (x, board_bbox[1]), (x, board_bbox[3]), (255, 0, 0), 1)
+
+            for i in range(1, rows):
+                y = board_bbox[1] + i * cell_height
+                cv2.line(annotated, (board_bbox[0], y), (board_bbox[2], y), (255, 0, 0), 1)
+
+            # Ahora puedes iterar por cada casilla y analizarla
+            # por ejemplo, para detectar qué ficha (chip) está dentro de cada una.
 
         annotated = results[0].plot()
 
