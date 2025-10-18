@@ -1,8 +1,0 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from skimage import io, filters, measure, morphology, segmentation
-from skimage.color import rgb2gray, rgb2hsv
-from skimage.feature import canny, corner_harris, corner_peaks
-from skimage.transform import hough_line, hough_line_peaks, hough_circle
-from skimage.util import random_noise
-import cv2  # Para algunas funciones complementarias
