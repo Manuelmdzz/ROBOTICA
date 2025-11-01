@@ -1,0 +1,552 @@
+import cv2
+import pygame
+import pymunk
+import numpy as np
+import sys
+import random
+import mediapipe as mp 
+
+# --- Configuración General ---
+FPS = 60
+
+# --- Configuración de Pymunk (Físicas) ---
+GRAVEDAD = (0, -981)
+ANCHO_JUEGO = 500
+ALTO_JUEGO_CAJA = 600  # Alto del contenedor de frutas
+ALTO_PANEL_CONTROL = 180
+ALTO_JUEGO = ALTO_JUEGO_CAJA + ALTO_PANEL_CONTROL 
+
+# --- Configuración de Cámara para CV2 ---
+ANCHO_CAMARA = ANCHO_JUEGO 
+ALTO_CAMARA = 180 
+POS_CAMARA_X = 0 
+POS_CAMARA_Y = 10 
+CHROMA_KEY_COLOR = (0, 0, 0) 
+
+# --- Configuración de Frutas con Imágenes ---
+FRUTAS_INFO = [
+    (20, "Cereza", "img/cereza.png"),
+    (30, "Fresa", "img/fresa.png"),
+    (45, "Uva", "img/uva.png"),
+    (50, "Melocotón", "img/melocoton.png"),
+    (60, "Naranja", "img/naranja.png"),
+    (70, "Manzana", "img/manzana.png"),
+    (85, "Melón", "img/melon.png"),
+    (100, "Sandía", "img/sandia.png"), 
+    (120, "Calabaza", "img/calabaza.png"), 
+]
+
+radios_frutas = [info[0] for info in FRUTAS_INFO]
+MAPA_FUSION = {radios_frutas[i]: radios_frutas[i+1] for i in range(len(radios_frutas) - 1)}
+if radios_frutas:
+    MAPA_FUSION[radios_frutas[-1]] = radios_frutas[-1] 
+
+# --- NUEVO: Constantes de Puntuación ---
+# Puntos por soltar (1, 2, 3, 4...)
+PUNTOS_POR_SOLTAR = {radio: (i+1) for i, radio in enumerate(radios_frutas)}
+# Puntos por fusionar (10, 20, 30, 40...)
+PUNTOS_POR_FUSION = {radio: (i+1) * 10 for i, radio in enumerate(radios_frutas)}
+# --- FIN DEL NUEVO CÓDIGO ---
+
+# --- Caché global para imágenes cargadas y fondo ---
+IMAGENES_FRUTAS = {}
+FONDO_JUEGO = None
+
+# --- Clase Fruta (Sin cambios) ---
+class Fruta:
+    def __init__(self, radio, pos, space):
+        self.radio = radio
+        info = next((info for info in FRUTAS_INFO if info[0] == radio), (radio, "Desconocida", "img/default.png"))
+        self.nombre = info[1]
+        
+        if radio in IMAGENES_FRUTAS:
+            self.imagen = IMAGENES_FRUTAS[radio]
+        else:
+            # Fallback si la imagen no se cargó
+            self.imagen = IMAGENES_FRUTAS.get(20, None) 
+            
+        self.pos = pos
+        self.space = space
+        self.fusionada = False 
+
+        self.masa = radio * 0.1
+        self.momento = pymunk.moment_for_circle(self.masa, 0, self.radio)
+        self.cuerpo = pymunk.Body(self.masa, self.momento)
+        self.cuerpo.position = pos
+        
+        self.forma = pymunk.Circle(self.cuerpo, self.radio)
+        self.forma.friction = 0.8
+        self.forma.elasticity = 0.2
+        self.forma.density = 1.0
+        self.forma.collision_type = self.radio
+
+    def agregar_a_space(self):
+        if self.cuerpo not in self.space.bodies:
+            self.space.add(self.cuerpo, self.forma)
+            
+    def remover_de_space(self):
+        if self.cuerpo in self.space.bodies:
+             self.space.remove(self.cuerpo, self.forma)
+
+    def dibujar(self, pantalla_pygame):
+        p = self.cuerpo.position
+        # Convertir coord Pymunk (abajo-izquierda) a Pygame (arriba-izquierda)
+        p_pygame = (int(p.x), int(ALTO_JUEGO - p.y)) 
+        
+        if self.imagen:
+            angulo_grados = np.degrees(self.cuerpo.angle)
+            imagen_rotada = pygame.transform.rotate(self.imagen, -angulo_grados)
+            rect = imagen_rotada.get_rect(center=p_pygame)
+            pantalla_pygame.blit(imagen_rotada, rect.topleft)
+        else:
+            # Dibujar círculo de fallback si la imagen falló
+            pygame.draw.circle(pantalla_pygame, (255, 0, 255), p_pygame, int(self.radio))
+
+
+# --- Funciones Auxiliares ---
+
+def crear_paredes_pymunk(space):
+    # (Coordenadas Pymunk: 0,0 es abajo-izquierda)
+    suelo = pymunk.Segment(space.static_body, (0, 0), (ANCHO_JUEGO, 0), 5)
+    pared_izquierda = pymunk.Segment(space.static_body, (0, 0), (0, ALTO_JUEGO_CAJA), 5)
+    pared_derecha = pymunk.Segment(space.static_body, (ANCHO_JUEGO, 0), (ANCHO_JUEGO, ALTO_JUEGO_CAJA), 5)
+    techo_caida = pymunk.Segment(space.static_body, (0, ALTO_JUEGO_CAJA), (ANCHO_JUEGO, ALTO_JUEGO_CAJA), 5)
+    
+    techo_caida.collision_type = 99 
+    
+    for s in [suelo, pared_izquierda, pared_derecha, techo_caida]:
+        s.elasticity = 0.5
+        s.friction = 1.0
+        if s != techo_caida:
+             s.collision_type = 0
+        space.add(s)
+
+
+def fusion_callback(arbiter, space, data):
+    global JUEGO_GANADO
+    # --- NUEVO: Acceder al puntaje ---
+    global puntuacion_actual
+    # --- FIN DEL NUEVO CÓDIGO ---
+
+    forma_a, forma_b = arbiter.shapes
+    
+    # Ignorar colisiones con paredes (tipo 0)
+    if forma_a.collision_type == 0 or forma_b.collision_type == 0:
+        return True
+
+    fruta_a = next((f for f in data['frutas'] if f.forma == forma_a), None)
+    fruta_b = next((f for f in data['frutas'] if f.forma == forma_b), None)
+
+    if not fruta_a or not fruta_b:
+        return True
+
+    # Comprobar si son del mismo tipo y no están ya marcadas para fusión
+    if fruta_a.radio == fruta_b.radio and not fruta_a.fusionada and not fruta_b.fusionada:
+        
+        # --- NUEVO: Añadir puntos por fusión ---
+        puntuacion_actual += PUNTOS_POR_FUSION.get(fruta_a.radio, 0)
+        # --- FIN DEL NUEVO CÓDIGO ---
+
+        fruta_a.fusionada = True
+        fruta_b.fusionada = True
+        
+        data['frutas_a_eliminar_en_step'].append(fruta_a)
+        data['frutas_a_eliminar_en_step'].append(fruta_b)
+        
+        pos_nueva = (fruta_a.cuerpo.position + fruta_b.cuerpo.position) / 2
+        nuevo_radio = MAPA_FUSION.get(fruta_a.radio, fruta_a.radio)
+
+        if fruta_a.radio == radios_frutas[-1]:
+            print("¡¡FUSIÓN DE CALABAZAS!! ¡HAS GANADO!")
+            JUEGO_GANADO = True
+        
+        if nuevo_radio != fruta_a.radio: 
+            nueva_fruta = Fruta(nuevo_radio, pos_nueva, space)
+            data['nuevas_frutas_en_step'].append(nueva_fruta)
+            data['frutas'].append(nueva_fruta) 
+            
+    return True
+
+def cargar_recursos():
+    global FONDO_JUEGO, IMAGENES_FRUTAS
+    
+    print("Cargando recursos...")
+    try:
+        fondo_img = pygame.image.load("img/fondo_juego.jpg").convert()
+        FONDO_JUEGO = pygame.transform.scale(fondo_img, (ANCHO_JUEGO, ALTO_JUEGO_CAJA))
+
+        for radio, nombre, img_path in FRUTAS_INFO:
+            try:
+                imagen = pygame.image.load(img_path).convert_alpha()
+                diametro = int(radio * 2)
+                imagen_escalada = pygame.transform.scale(imagen, (diametro, diametro))
+                IMAGENES_FRUTAS[radio] = imagen_escalada
+                print(f" - Cargada {nombre} ({img_path})")
+            except Exception as e:
+                print(f"ERROR: No se pudo cargar la imagen de fruta: {img_path}")
+                print(e)
+                fallback_surf = pygame.Surface((radio*2, radio*2), pygame.SRCALPHA)
+                fallback_surf.fill((0,0,0,0)) 
+                pygame.draw.circle(fallback_surf, (255, 0, 255), (radio, radio), radio) 
+                IMAGENES_FRUTAS[radio] = fallback_surf
+
+    except Exception as e:
+        print(f"ERROR: No se pudo cargar la imagen de fondo: img/fondo_juego.jpg")
+        print(e)
+        FONDO_JUEGO = None
+    
+    if not IMAGENES_FRUTAS:
+         print("ERROR CRÍTICO: No se cargó ninguna imagen de fruta. Saliendo.")
+         pygame.quit()
+         sys.exit()
+
+# --- Inicialización ---
+
+pygame.init()
+pantalla = pygame.display.set_mode((ANCHO_JUEGO, ALTO_JUEGO))
+pygame.display.set_caption("Fruit Merge con Hand Control (MediaPipe)")
+reloj = pygame.time.Clock()
+pygame.font.init()
+
+cargar_recursos()
+
+# Inicialización de Pymunk
+space = pymunk.Space()
+space.gravity = GRAVEDAD
+crear_paredes_pymunk(space)
+
+# Inicialización de OpenCV
+cap = cv2.VideoCapture(0)
+
+# --- INICIALIZACIÓN DE MEDIAPIPE HANDS ---
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+mp_draw = mp.solutions.drawing_utils
+
+
+# --- Variables del Juego ---
+frutas = []
+# --- OPTIMIZACIÓN: Lista para guardar los handlers ---
+collision_handlers = [] 
+# ---
+fruta_cayendo = None
+tiempo_ultimo_lanzamiento = 0
+DELAY_LANZAMIENTO = 0.8 # Segundos
+
+# --- Delay para que aparezca la siguiente fruta ---
+DELAY_NUEVA_FRUTA = 1.0  # (Espera 1.0 segundo después de soltar)
+tiempo_ultimo_soltar_real = 0
+
+
+# Crear y guardar los handlers UNA SOLA VEZ
+for radio in radios_frutas:
+    handler = space.add_collision_handler(radio, radio) 
+    handler.data["frutas"] = frutas 
+    handler.data["nuevas_frutas_en_step"] = [] 
+    handler.data["frutas_a_eliminar_en_step"] = [] 
+    handler.post_solve = fusion_callback
+    collision_handlers.append(handler) # <-- ¡Los guardamos aquí!
+
+def obtener_nueva_fruta_aleatoria():
+    radio_inicial = random.choice(radios_frutas[:3])
+    f = Fruta(radio_inicial, (ANCHO_JUEGO / 2, ALTO_JUEGO_CAJA - radio_inicial), space) 
+    return f
+
+# --- Estados del juego ---
+MENU = 0
+JUGANDO = 1
+FINALIZADO = 2
+ESTADO_ACTUAL = MENU
+
+# --- NUEVO: Variables de Puntuación ---
+puntuacion_actual = 0
+puntuacion_final = 0
+# --- FIN DEL NUEVO CÓDIGO ---
+
+# --- Variables de Victoria/Derrota ---
+JUEGO_GANADO = False
+JUEGO_PERDIDO = False
+LINEA_PERDER_Y = ALTO_JUEGO_CAJA - 30 
+tiempo_en_zona_peligro_inicio = 0
+DURACION_PARA_PERDER = 5 # Segundos
+
+
+# --- Bucle Principal del Juego ---
+running = True
+while running:
+    for evento in pygame.event.get():
+        if evento.type == pygame.QUIT:
+            running = False
+            
+    # --- Procesamiento de Cámara y Control de Mano (MediaPipe) ---
+    ret, frame_cv2 = cap.read()
+    if not ret:
+        print("Error al leer la cámara.")
+        break
+    frame_cv2 = cv2.flip(frame_cv2, 1) 
+    frame_rgb = cv2.cvtColor(frame_cv2, cv2.COLOR_BGR2RGB)
+    
+    results = hands.process(frame_rgb)
+    
+    x_posicion_fruta = ANCHO_JUEGO / 2 
+    mano_abierta_para_soltar = False
+    mano_cerrada_para_agarrar = False
+    todos_dedos_extendidos = False 
+    
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame_cv2, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            
+            landmark_punta_indice = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            x_posicion_fruta = int(landmark_punta_indice.x * ANCHO_JUEGO)
+            
+            thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+            index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            distancia_pulgar_indice = ((thumb_tip.x - index_tip.x)**2 + (thumb_tip.y - index_tip.y)**2)**0.5
+            
+            UMBRAL_CERRADA = 0.05
+            UMBRAL_ABIERTA = 0.15
+            
+            if distancia_pulgar_indice < UMBRAL_CERRADA:
+                mano_cerrada_para_agarrar = True
+            elif distancia_pulgar_indice > UMBRAL_ABIERTA:
+                mano_abierta_para_soltar = True
+
+            dedos_extendidos = []
+            dedos_indices = [
+                (mp_hands.HandLandmark.INDEX_FINGER_TIP, mp_hands.HandLandmark.INDEX_FINGER_PIP),
+                (mp_hands.HandLandmark.MIDDLE_FINGER_TIP, mp_hands.HandLandmark.MIDDLE_FINGER_PIP),
+                (mp_hands.HandLandmark.RING_FINGER_TIP, mp_hands.HandLandmark.RING_FINGER_PIP),
+                (mp_hands.HandLandmark.PINKY_TIP, mp_hands.HandLandmark.PINKY_PIP)
+            ]
+            
+            for tip, pip in dedos_indices:
+                if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[pip].y:
+                    dedos_extendidos.append(True)
+                else:
+                    dedos_extendidos.append(False)
+            
+            thumb_is_extended = False
+            thumb_tip_lm = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+            thumb_ip_lm = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_IP] 
+            if hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].x < hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_MCP].x:
+                thumb_is_extended = True
+            
+            if all(dedos_extendidos) and thumb_is_extended:
+                todos_dedos_extendidos = True
+                
+    if fruta_cayendo:
+        radio = fruta_cayendo.radio
+        x_posicion_fruta = max(radio, min(ANCHO_JUEGO - radio, x_posicion_fruta))
+
+    # --- Lógica del juego según el estado ---
+    
+    if ESTADO_ACTUAL == MENU:
+        if todos_dedos_extendidos: 
+            ESTADO_ACTUAL = JUGANDO
+            
+            # --- Resetear ---
+            puntuacion_actual = 0
+            JUEGO_GANADO = False
+            JUEGO_PERDIDO = False
+            tiempo_en_zona_peligro_inicio = 0
+            
+            for f in frutas:
+                f.remover_de_space()
+            frutas = []
+            
+            for handler in collision_handlers:
+                handler.data["frutas"] = frutas
+                handler.data["nuevas_frutas_en_step"] = [] 
+                handler.data["frutas_a_eliminar_en_step"] = [] 
+            
+            fruta_cayendo = None
+            tiempo_ultimo_lanzamiento = 0
+            tiempo_ultimo_soltar_real = 0 
+            
+    elif ESTADO_ACTUAL == JUGANDO:
+        
+        tiempo_actual_bucle = pygame.time.get_ticks() / 1000.0
+        
+        # 1. Generar nueva fruta (con delay)
+        if not fruta_cayendo:
+            if (tiempo_actual_bucle - tiempo_ultimo_soltar_real) > DELAY_NUEVA_FRUTA:
+                fruta_cayendo = obtener_nueva_fruta_aleatoria()
+        
+        # 2. Mover y soltar (si hay fruta)
+        if fruta_cayendo:
+            if mano_cerrada_para_agarrar:
+                fruta_cayendo.cuerpo.position = (x_posicion_fruta, ALTO_JUEGO_CAJA - fruta_cayendo.radio)
+                tiempo_ultimo_lanzamiento = tiempo_actual_bucle
+            else:
+                fruta_cayendo.cuerpo.position = (x_posicion_fruta, ALTO_JUEGO_CAJA - fruta_cayendo.radio)
+            
+            # 3. Soltar la fruta
+            if mano_abierta_para_soltar:
+                if (tiempo_actual_bucle - tiempo_ultimo_lanzamiento) > DELAY_LANZAMIENTO:
+                    
+                    # --- NUEVO: Añadir puntos por soltar ---
+                    puntuacion_actual += PUNTOS_POR_SOLTAR.get(fruta_cayendo.radio, 0)
+                    # --- FIN DEL NUEVO CÓDIGO ---
+                    
+                    fruta_cayendo.agregar_a_space()
+                    frutas.append(fruta_cayendo)
+                    fruta_cayendo = None 
+                    tiempo_ultimo_lanzamiento = tiempo_actual_bucle
+                    tiempo_ultimo_soltar_real = tiempo_actual_bucle
+                        
+        # 4. Actualizar simulación
+        space.step(1.0/FPS)
+
+        # 5. Procesar fusiones
+        frutas_a_eliminar_final = []
+        frutas_a_añadir_final = []
+        
+        for handler in collision_handlers:
+            frutas_a_añadir_final.extend(handler.data.get("nuevas_frutas_en_step", []))
+            frutas_a_eliminar_final.extend(handler.data.get("frutas_a_eliminar_en_step", []))
+            if "nuevas_frutas_en_step" in handler.data:
+                handler.data["nuevas_frutas_en_step"] = []
+            if "frutas_a_eliminar_en_step" in handler.data:
+                handler.data["frutas_a_eliminar_en_step"] = []
+        
+        for fruta_eliminada in set(frutas_a_eliminar_final):
+            fruta_eliminada.remover_de_space()
+            if fruta_eliminada in frutas:
+                frutas.remove(fruta_eliminada)
+        
+        for nueva_fruta in frutas_a_añadir_final:
+            nueva_fruta.agregar_a_space()
+
+        # --- Detectar si hubo fusiones (para el timer de Game Over) ---
+        hubo_fusiones_este_frame = len(frutas_a_añadir_final) > 0 or len(frutas_a_eliminar_final) > 0
+        
+        for fruta in frutas:
+            fruta.fusionada = False
+
+        # 6. Lógica de Victoria/Derrota
+        
+        if JUEGO_GANADO:
+            ESTADO_ACTUAL = FINALIZADO
+            puntuacion_final = puntuacion_actual # Guardar puntaje
+
+        else: 
+            fruta_en_peligro = False
+            for fruta in frutas:
+                if (fruta.cuerpo.position.y + fruta.radio) > LINEA_PERDER_Y:
+                    fruta_en_peligro = True
+                    break
+            
+            tiempo_actual = tiempo_actual_bucle
+            
+            if fruta_en_peligro:
+                # --- Timer de Game Over Justo ---
+                if not hubo_fusiones_este_frame:
+                    if tiempo_en_zona_peligro_inicio == 0:
+                        tiempo_en_zona_peligro_inicio = tiempo_actual
+                    elif (tiempo_actual - tiempo_en_zona_peligro_inicio) > DURACION_PARA_PERDER:
+                        print("¡GAME OVER! Fruta demasiado alta.")
+                        JUEGO_PERDIDO = True
+                        ESTADO_ACTUAL = FINALIZADO
+                        puntuacion_final = puntuacion_actual # Guardar puntaje
+                else:
+                    tiempo_en_zona_peligro_inicio = 0 # Resetear timer si hay fusión
+            else:
+                tiempo_en_zona_peligro_inicio = 0
+
+    elif ESTADO_ACTUAL == FINALIZADO:
+        if todos_dedos_extendidos:
+            ESTADO_ACTUAL = MENU
+
+
+    # --- Dibujo en Pygame ---
+    pantalla.fill((0, 0, 50)) 
+    
+    if FONDO_JUEGO:
+        pantalla.blit(FONDO_JUEGO, (0, ALTO_PANEL_CONTROL))
+    else:
+        pygame.draw.rect(pantalla, (20, 20, 20), (0, ALTO_PANEL_CONTROL, ANCHO_JUEGO, ALTO_JUEGO_CAJA))
+
+
+    if ESTADO_ACTUAL == JUGANDO:
+        y_pygame_linea = ALTO_JUEGO - LINEA_PERDER_Y 
+        linea_color = (255, 0, 0) 
+        if tiempo_en_zona_peligro_inicio > 0:
+            if int(pygame.time.get_ticks() / 250) % 2 == 0:
+                 linea_color = (255, 150, 150) 
+        pygame.draw.line(pantalla, linea_color, (0, y_pygame_linea), (ANCHO_JUEGO, y_pygame_linea), 3)
+    
+    pygame.draw.line(pantalla, (255, 255, 255), (0, ALTO_PANEL_CONTROL), (ANCHO_JUEGO, ALTO_PANEL_CONTROL), 3)
+
+    if ESTADO_ACTUAL == JUGANDO or ESTADO_ACTUAL == FINALIZADO:
+        for fruta in frutas:
+            fruta.dibujar(pantalla)
+        if fruta_cayendo and ESTADO_ACTUAL == JUGANDO:
+            fruta_cayendo.dibujar(pantalla)
+            
+        if fruta_cayendo and ESTADO_ACTUAL == JUGANDO:
+            guia_y_pygame_inicio = ALTO_PANEL_CONTROL
+            guia_y_pygame_fin = ALTO_JUEGO
+            pygame.draw.line(pantalla, (255, 255, 255, 100), (x_posicion_fruta, guia_y_pygame_inicio), (x_posicion_fruta, guia_y_pygame_fin), 1)
+            
+    # --- Integrar la Cámara de CV2 ---
+    frame_cv2_resized = cv2.resize(frame_cv2, (ANCHO_CAMARA, ALTO_CAMARA))
+    frame_cv2_rgb_pygame = cv2.cvtColor(frame_cv2_resized, cv2.COLOR_BGR2RGB)
+    surface_cv2 = pygame.surfarray.make_surface(frame_cv2_rgb_pygame.swapaxes(0, 1))
+    surface_cv2.set_colorkey(CHROMA_KEY_COLOR)
+    pantalla.blit(surface_cv2, (POS_CAMARA_X, POS_CAMARA_Y))
+    
+    # --- Mostrar mensajes en el panel de control ---
+    fuente_panel = pygame.font.Font(None, 24)
+    fuente_titulo = pygame.font.Font(None, 40)
+    
+    if ESTADO_ACTUAL == MENU:
+        texto_titulo = fuente_titulo.render("FRUIT MERGE", 1, (255, 255, 255))
+        pantalla.blit(texto_titulo, (ANCHO_JUEGO // 2 - texto_titulo.get_width() // 2, ALTO_PANEL_CONTROL // 2 - 40))
+        texto_instruccion_menu = fuente_panel.render("Extiende todos los dedos para Empezar", 1, (200, 200, 255))
+        pantalla.blit(texto_instruccion_menu, (ANCHO_JUEGO // 2 - texto_instruccion_menu.get_width() // 2, ALTO_PANEL_CONTROL // 2 + 10))
+        
+    elif ESTADO_ACTUAL == JUGANDO:
+        texto_control = fuente_panel.render("Control: Mueve Mano / Suelta: Abre / Agarra: Cierra", 1, (255, 255, 255))
+        pantalla.blit(texto_control, (ANCHO_JUEGO // 2 - texto_control.get_width() // 2, ALTO_PANEL_CONTROL - 25))
+
+        # --- NUEVO: Mostrar puntaje actual ---
+        texto_score = fuente_titulo.render(f"Puntos: {puntuacion_actual}", 1, (255, 215, 0)) # Dorado
+        pantalla.blit(texto_score, (ANCHO_JUEGO // 2 - texto_score.get_width() // 2, 20)) 
+        # --- FIN DEL NUEVO CÓDIGO ---
+
+    elif ESTADO_ACTUAL == FINALIZADO:
+        mensaje_final = ""
+        color_final = (255, 255, 255)
+        
+        if JUEGO_GANADO:
+            mensaje_final = "¡GANASTE!"
+            color_final = (255, 215, 0) # Dorado
+        elif JUEGO_PERDIDO:
+            mensaje_final = "GAME OVER"
+            color_final = (255, 0, 0) # Rojo
+
+        texto_titulo = fuente_titulo.render(mensaje_final, 1, color_final)
+        pantalla.blit(texto_titulo, (ANCHO_JUEGO // 2 - texto_titulo.get_width() // 2, ALTO_PANEL_CONTROL // 2 - 40))
+
+        # --- MODIFICADO: Mostrar puntaje final ---
+        texto_score_final = fuente_panel.render(f"Puntuación Final: {puntuacion_final}", 1, (255, 255, 255))
+        pantalla.blit(texto_score_final, (ANCHO_JUEGO // 2 - texto_score_final.get_width() // 2, ALTO_PANEL_CONTROL // 2 + 10))
+        
+        texto_instruccion_menu = fuente_panel.render("Extiende todos los dedos para Reiniciar", 1, (200, 200, 255))
+        pantalla.blit(texto_instruccion_menu, (ANCHO_JUEGO // 2 - texto_instruccion_menu.get_width() // 2, ALTO_PANEL_CONTROL // 2 + 40))
+        # --- FIN DE LA MODIFICACIÓN ---
+
+    pygame.display.flip()
+    reloj.tick(FPS)
+
+# --- Finalización ---
+hands.close() 
+cap.release()
+pygame.quit()
+sys.exit()
